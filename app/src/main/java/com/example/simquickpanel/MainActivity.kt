@@ -101,7 +101,8 @@ fun FloatingControlOverlay(onDismiss: () -> Unit) {
                             return@ControlPillButton
                         }
                         isSim2On = !isSim2On
-                        ShizukuShellHelper.setSecondarySimEnabled(isSim2On)
+                        val result = ShizukuShellHelper.setSecondarySimEnabled(isSim2On)
+                        if (result.isNotBlank()) Toast.makeText(context, result, Toast.LENGTH_SHORT).show()
                     }
                 )
 
@@ -122,7 +123,8 @@ fun FloatingControlOverlay(onDismiss: () -> Unit) {
                             NetworkMode.MODE_4G -> NetworkMode.MODE_3G
                             NetworkMode.MODE_3G -> NetworkMode.MODE_5G
                         }
-                        ShizukuShellHelper.setPrimarySimNetworkMode(networkMode)
+                        val result = ShizukuShellHelper.setPrimarySimNetworkMode(networkMode)
+                        if (result.isNotBlank()) Toast.makeText(context, result, Toast.LENGTH_SHORT).show()
                     }
                 )
 
@@ -139,7 +141,8 @@ fun FloatingControlOverlay(onDismiss: () -> Unit) {
                             return@ControlPillButton
                         }
                         isVoLteOn = !isVoLteOn
-                        ShizukuShellHelper.setPrimarySimVoLte(isVoLteOn)
+                        val result = ShizukuShellHelper.setPrimarySimVoLte(isVoLteOn)
+                        if (result.isNotBlank()) Toast.makeText(context, result, Toast.LENGTH_SHORT).show()
                     }
                 )
             }
