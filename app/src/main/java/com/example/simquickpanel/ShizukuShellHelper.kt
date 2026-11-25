@@ -2,6 +2,7 @@ package com.example.simquickpanel
 
 import android.content.pm.PackageManager
 import rikka.shizuku.Shizuku
+import rikka.shizuku.ShizukuRemoteProcess
 import java.io.BufferedReader
 import java.io.InputStreamReader
 
@@ -24,12 +25,27 @@ object ShizukuShellHelper {
 
     /**
      * Executes a shell command with ADB/Shell privileges via Shizuku.
+     * Uses reflection to access Shizuku.newProcess in Shizuku API 13+.
      */
     fun runShellCommand(command: String): String {
         if (!isShizukuReady()) return "SHIZUKU_NOT_READY"
         return try {
-            // Note: Uses Shizuku's privileged process execution
-            val process = Shizuku.newProcess(arrayOf("sh", "-c", command), null, null)
+            val newProcessMethod = Shizuku::class.java.getDeclaredMethod(
+                "newProcess",
+                Array<String>::class.java,
+                Array<String>::class.java,
+                String::class.java
+            ).apply {
+                isAccessible = true
+            }
+
+            val process = newProcessMethod.invoke(
+                null,
+                arrayOf("sh", "-c", command),
+                null,
+                null
+            ) as ShizukuRemoteProcess
+
             val reader = BufferedReader(InputStreamReader(process.inputStream))
             val output = reader.readText().trim()
             process.waitFor()
