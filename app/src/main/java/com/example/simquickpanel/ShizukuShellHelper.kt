@@ -41,7 +41,7 @@ object ShizukuShellHelper {
 
             val process = newProcessMethod.invoke(
                 null,
-                arrayOf("sh", "-c", command),
+                arrayOf("sh", "-c", "$command 2>&1"),
                 null,
                 null
             ) as ShizukuRemoteProcess
@@ -51,54 +51,78 @@ object ShizukuShellHelper {
             process.waitFor()
             output
         } catch (e: Exception) {
-            "ERROR: ${e.message}"
+            "ERROR: ${e.cause?.message ?: e.message}"
         }
+    }
+
+    /**
+     * Dynamically detects active subscription IDs mapped to Slot 0 (SIM 1) and Slot 1 (SIM 2)
+     */
+    fun getSlotSubIds(): Pair<Int, Int> {
+        val output = runShellCommand("cmd phone list-subscriptions")
+        var sim1SubId = 1
+        var sim2SubId = 2
+
+        // Parse lines like: "subId=3, simSlotIndex=0, ..."
+        output.lines().forEach { line ->
+            val subMatch = Regex("subId=(\\d+)").find(line)
+            val slotMatch = Regex("simSlotIndex=(\\d+)").find(line)
+            if (subMatch != null && slotMatch != null) {
+                val subId = subMatch.groupValues[1].toInt()
+                val slot = slotMatch.groupValues[1].toInt()
+                if (slot == 0) sim1SubId = subId
+                if (slot == 1) sim2SubId = subId
+            }
+        }
+        return Pair(sim1SubId, sim2SubId)
     }
 
     /**
      * 1. Toggle Secondary SIM (Slot Index 1) On/Off
-     * Note: SubId may vary per device (usually 1 or 2). Adjust subId if needed via `cmd phone list-subscriptions`.
      */
-    fun setSecondarySimEnabled(enable: Boolean, sim2SubId: Int = 2) {
+    fun setSecondarySimEnabled(enable: Boolean): String {
+        val (_, sim2SubId) = getSlotSubIds()
         val state = if (enable) "true" else "false"
-        // Works on AOSP / HyperOS Android 14-16 via Telephony shell command
-        runShellCommand("cmd phone set-sim-power-state-for-slot 1 ${if (enable) 1 else 0}")
-        runShellCommand("cmd phone set-subscription-enabled $sim2SubId $state")
+        val powerState = if (enable) 1 else 0
+
+        val out1 = runShellCommand("cmd phone set-sim-power-state-for-slot 1 $powerState")
+        val out2 = runShellCommand("cmd phone set-subscription-enabled $sim2SubId $state")
+        return "SIM2(sub=$sim2SubId): $out1 | $out2".trim()
     }
 
     /**
-     * 2. Swap Primary SIM (SubId 1) Network Mode: 3G / 4G / 5G
-     * Bitmasks:
-     * 5G (NR/LTE/WCDMA/GSM) = 524288 | 4096 | 32768 | ... -> standard value: 8486911 or network_mode 26
-     * 4G (LTE/WCDMA/GSM)    = 4096 -> network_mode 9
-     * 3G (WCDMA only/pref)  = 32768 -> network_mode 0
+     * 2. Swap Primary SIM Network Mode: 3G / 4G / 5G
      */
-    fun setPrimarySimNetworkMode(mode: NetworkMode, primarySubId: Int = 1) {
+    fun setPrimarySimNetworkMode(mode: NetworkMode): String {
+        val (primarySubId, _) = getSlotSubIds()
         val networkTypeBitmask = when (mode) {
-            NetworkMode.MODE_5G -> "524288" // NR_NSA + NR_SA fallback handled by modem
+            NetworkMode.MODE_5G -> "524288" // NR
             NetworkMode.MODE_4G -> "4096"   // LTE
             NetworkMode.MODE_3G -> "32768"  // WCDMA
         }
         val legacyModeInt = when (mode) {
-            NetworkMode.MODE_5G -> 26 // NETWORK_MODE_NR_LTE_GSM_WCDMA
-            NetworkMode.MODE_4G -> 9  // NETWORK_MODE_LTE_GSM_WCDMA
-            NetworkMode.MODE_3G -> 0  // NETWORK_MODE_WCDMA_PREF
+            NetworkMode.MODE_5G -> 26 // NR_LTE_GSM_WCDMA
+            NetworkMode.MODE_4G -> 9  // LTE_GSM_WCDMA
+            NetworkMode.MODE_3G -> 0  // WCDMA_PREF
         }
 
-        // Set both modern Android 16 bitmask & HyperOS settings database keys
-        runShellCommand("cmd phone set-allowed-network-types-for-users -s $primarySubId $networkTypeBitmask")
-        runShellCommand("settings put global preferred_network_mode$primarySubId $legacyModeInt")
+        val out1 = runShellCommand("cmd phone set-allowed-network-types-for-users -s $primarySubId $networkTypeBitmask")
+        val out2 = runShellCommand("settings put global preferred_network_mode$primarySubId $legacyModeInt")
+        // HyperOS also checks comma-separated preferred_network_mode
+        val out3 = runShellCommand("settings put global preferred_network_mode $legacyModeInt,$legacyModeInt")
+        return "Net(sub=$primarySubId): $out1 $out2 $out3".trim()
     }
 
     /**
      * 3. Switch Primary SIM VoLTE On/Off
      */
-    fun setPrimarySimVoLte(enable: Boolean, primarySubId: Int = 1) {
+    fun setPrimarySimVoLte(enable: Boolean): String {
+        val (primarySubId, _) = getSlotSubIds()
         val value = if (enable) 1 else 0
-        // Updates IMS/VoLTE flags recognized by HyperOS / Qualcomm modems
-        runShellCommand("settings put global volte_vt_enabled $value")
-        runShellCommand("settings put global volte_vt_enabled$primarySubId $value")
-        runShellCommand("cmd phone ims set-ims-service-enabled -s $primarySubId ${if (enable) "true" else "false"}")
+        val out1 = runShellCommand("settings put global volte_vt_enabled $value")
+        val out2 = runShellCommand("settings put global volte_vt_enabled$primarySubId $value")
+        val out3 = runShellCommand("cmd phone ims set-ims-service-enabled -s $primarySubId ${if (enable) "true" else "false"}")
+        return "VoLTE(sub=$primarySubId): $out1 $out2 $out3".trim()
     }
 }
 
