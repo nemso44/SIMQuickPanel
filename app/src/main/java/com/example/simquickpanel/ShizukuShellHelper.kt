@@ -90,31 +90,35 @@ object ShizukuShellHelper {
     }
 
     /**
-     * 1. Toggle Secondary SIM (Slot 1) On/Off across AOSP + Xiaomi HyperOS
+     * 1. Toggle Secondary SIM (Slot 1) On/Off across Xiaomi HyperOS / AOSP
+     * Note: HyperOS removed `set-subscription-enabled` and `set-sim-power-state-for-slot` from `cmd phone`.
      */
     suspend fun setSecondarySimEnabled(enable: Boolean): String {
         val (_, sim2SubId) = getSlotSubIds()
-        val boolStr = if (enable) "true" else "false"
         val intVal = if (enable) 1 else 0
+        val boolStr = if (enable) "true" else "false"
 
-        // Run AOSP subscription toggle + slot power state + MIUI/HyperOS global setting
+        // Try HyperOS/MIUI global keys + fallback phone commands without failing the chain
         val cmd = listOf(
-            "cmd phone set-subscription-enabled $sim2SubId $boolStr",
-            "cmd phone set-sim-power-state-for-slot 1 $intVal",
-            "settings put global sim_enabled_1 $intVal"
+            "settings put global sim_enabled_1 $intVal",
+            "settings put global multi_sim_enabled_1 $intVal",
+            "cmd phone set-sim-power-state 1 $boolStr 2>/dev/null || true",
+            "settings get global sim_enabled_1"
         ).joinToString(" ; ")
 
         val res = runShellCommand(cmd)
-        return "SIM2 [sub:$sim2SubId -> $boolStr]: $res"
+        return "SIM2 [sub:$sim2SubId -> $intVal] readback=$res"
     }
 
     /**
      * 2. Swap Primary SIM Network Mode: 3G / 4G / 5G
+     * Sets both Android allowed-network-types and MIUI/HyperOS preferred_network_mode keys,
+     * then reads back the updated value so we know if HyperOS applied it.
      */
     suspend fun setPrimarySimNetworkMode(mode: NetworkMode): String {
-        val (primarySubId, secondarySubId) = getSlotSubIds()
+        val (primarySubId, _) = getSlotSubIds()
 
-        // Android 12+ allowed network type bitmasks (combined GSM+WCDMA+LTE+NR so modem doesn't reject single-RAT masks)
+        // Android 12+ allowed network type bitmasks (composite masks so modem accepts them)
         val bitmask = when (mode) {
             NetworkMode.MODE_5G -> "561151" // NR + LTE + WCDMA + GSM
             NetworkMode.MODE_4G -> "36863"  // LTE + WCDMA + GSM (no NR)
@@ -128,38 +132,50 @@ object ShizukuShellHelper {
             NetworkMode.MODE_3G -> 0  // WCDMA_PREF
         }
 
-        // Read existing SIM 2 mode so we preserve comma-separated "sim1,sim2" format used by Xiaomi
-        val currentDual = runShellCommand("settings get global preferred_network_mode")
-        val sim2Mode = currentDual.split(",").getOrNull(1)?.trim()?.toIntOrNull() ?: 26
+        // Read existing dual-SIM mode string (e.g., "26,26" or "9,26")
+        val rawDual = runShellCommand("settings get global preferred_network_mode")
+        val parts = rawDual.split(",").map { it.trim() }.toMutableList()
+        if (parts.size < 2) {
+            parts.clear()
+            parts.add(modeInt.toString())
+            parts.add("26")
+        } else {
+            parts[0] = modeInt.toString()
+        }
+        val updatedDual = parts.joinToString(",")
 
         val cmd = listOf(
-            "cmd phone set-allowed-network-types-for-users -s $primarySubId $bitmask",
+            "(cmd phone set-allowed-network-types-for-users -s $primarySubId $bitmask 2>/dev/null || true)",
             "settings put global preferred_network_mode$primarySubId $modeInt",
-            "settings put global preferred_network_mode $modeInt,$sim2Mode",
-            "settings put global user_preferred_network_mode $modeInt,$sim2Mode"
+            "settings put global preferred_network_mode0 $modeInt",
+            "settings put global preferred_network_mode $updatedDual",
+            "settings put global user_preferred_network_mode $updatedDual",
+            "settings get global preferred_network_mode"
         ).joinToString(" ; ")
 
         val res = runShellCommand(cmd)
-        return "SIM1 ${mode.label} [sub:$primarySubId]: $res"
+        return "SIM1 ${mode.label} [sub:$primarySubId] mode=$res"
     }
 
     /**
      * 3. Switch Primary SIM VoLTE On/Off
+     * Avoids `cmd phone ims ...` (which returned exit=255 on HyperOS) and writes
+     * global/secure VoLTE keys + reads back the value.
      */
     suspend fun setPrimarySimVoLte(enable: Boolean): String {
         val (primarySubId, _) = getSlotSubIds()
         val intVal = if (enable) 1 else 0
-        val boolStr = if (enable) "true" else "false"
 
         val cmd = listOf(
             "settings put global volte_vt_enabled $intVal",
             "settings put global volte_vt_enabled0 $intVal",
             "settings put global volte_vt_enabled$primarySubId $intVal",
-            "cmd phone ims set-ims-service-enabled -s $primarySubId $boolStr"
+            "settings put secure volte_vt_enabled $intVal",
+            "settings get global volte_vt_enabled"
         ).joinToString(" ; ")
 
         val res = runShellCommand(cmd)
-        return "VoLTE [sub:$primarySubId -> $boolStr]: $res"
+        return "VoLTE [sub:$primarySubId -> $intVal] readback=$res"
     }
 }
 
