@@ -1,6 +1,8 @@
 package com.example.simquickpanel
 
 import android.content.pm.PackageManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import rikka.shizuku.Shizuku
 import rikka.shizuku.ShizukuRemoteProcess
 import java.io.BufferedReader
@@ -8,28 +10,39 @@ import java.io.InputStreamReader
 
 object ShizukuShellHelper {
 
-    fun isShizukuReady(): Boolean {
+    fun isBinderAlive(): Boolean {
         return try {
-            Shizuku.pingBinder() &&
-                Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+            Shizuku.pingBinder()
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    fun hasPermission(): Boolean {
+        return try {
+            isBinderAlive() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
         } catch (e: Exception) {
             false
         }
     }
 
     fun requestPermission(requestCode: Int = 1001) {
-        if (Shizuku.pingBinder() && Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
-            Shizuku.requestPermission(requestCode)
+        try {
+            if (isBinderAlive() && Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+                Shizuku.requestPermission(requestCode)
+            }
+        } catch (_: Exception) {
         }
     }
 
     /**
-     * Executes a shell command with ADB/Shell privileges via Shizuku.
-     * Uses reflection to access Shizuku.newProcess in Shizuku API 13+.
+     * Executes a shell command via Shizuku on an IO thread and captures both stdout and stderr.
      */
-    fun runShellCommand(command: String): String {
-        if (!isShizukuReady()) return "SHIZUKU_NOT_READY"
-        return try {
+    suspend fun runShellCommand(command: String): String = withContext(Dispatchers.IO) {
+        if (!isBinderAlive()) return@withContext "ERR: Shizuku service not running"
+        if (!hasPermission()) return@withContext "ERR: Shizuku permission denied"
+
+        return@withContext try {
             val newProcessMethod = Shizuku::class.java.getDeclaredMethod(
                 "newProcess",
                 Array<String>::class.java,
@@ -48,22 +61,21 @@ object ShizukuShellHelper {
 
             val reader = BufferedReader(InputStreamReader(process.inputStream))
             val output = reader.readText().trim()
-            process.waitFor()
-            output
+            val exitCode = process.waitFor()
+            if (output.isEmpty()) "OK (exit=$exitCode)" else output
         } catch (e: Exception) {
-            "ERROR: ${e.cause?.message ?: e.message}"
+            "EX: ${e.cause?.message ?: e.message}"
         }
     }
 
     /**
-     * Dynamically detects active subscription IDs mapped to Slot 0 (SIM 1) and Slot 1 (SIM 2)
+     * Parses active subIds for Slot 0 (SIM 1) and Slot 1 (SIM 2) from dumpsys or cmd phone.
      */
-    fun getSlotSubIds(): Pair<Int, Int> {
+    suspend fun getSlotSubIds(): Pair<Int, Int> {
         val output = runShellCommand("cmd phone list-subscriptions")
         var sim1SubId = 1
         var sim2SubId = 2
 
-        // Parse lines like: "subId=3, simSlotIndex=0, ..."
         output.lines().forEach { line ->
             val subMatch = Regex("subId=(\\d+)").find(line)
             val slotMatch = Regex("simSlotIndex=(\\d+)").find(line)
@@ -78,51 +90,76 @@ object ShizukuShellHelper {
     }
 
     /**
-     * 1. Toggle Secondary SIM (Slot Index 1) On/Off
+     * 1. Toggle Secondary SIM (Slot 1) On/Off across AOSP + Xiaomi HyperOS
      */
-    fun setSecondarySimEnabled(enable: Boolean): String {
+    suspend fun setSecondarySimEnabled(enable: Boolean): String {
         val (_, sim2SubId) = getSlotSubIds()
-        val state = if (enable) "true" else "false"
-        val powerState = if (enable) 1 else 0
+        val boolStr = if (enable) "true" else "false"
+        val intVal = if (enable) 1 else 0
 
-        val out1 = runShellCommand("cmd phone set-sim-power-state-for-slot 1 $powerState")
-        val out2 = runShellCommand("cmd phone set-subscription-enabled $sim2SubId $state")
-        return "SIM2(sub=$sim2SubId): $out1 | $out2".trim()
+        // Run AOSP subscription toggle + slot power state + MIUI/HyperOS global setting
+        val cmd = listOf(
+            "cmd phone set-subscription-enabled $sim2SubId $boolStr",
+            "cmd phone set-sim-power-state-for-slot 1 $intVal",
+            "settings put global sim_enabled_1 $intVal"
+        ).joinToString(" ; ")
+
+        val res = runShellCommand(cmd)
+        return "SIM2 [sub:$sim2SubId -> $boolStr]: $res"
     }
 
     /**
      * 2. Swap Primary SIM Network Mode: 3G / 4G / 5G
      */
-    fun setPrimarySimNetworkMode(mode: NetworkMode): String {
-        val (primarySubId, _) = getSlotSubIds()
-        val networkTypeBitmask = when (mode) {
-            NetworkMode.MODE_5G -> "524288" // NR
-            NetworkMode.MODE_4G -> "4096"   // LTE
-            NetworkMode.MODE_3G -> "32768"  // WCDMA
+    suspend fun setPrimarySimNetworkMode(mode: NetworkMode): String {
+        val (primarySubId, secondarySubId) = getSlotSubIds()
+
+        // Android 12+ allowed network type bitmasks (combined GSM+WCDMA+LTE+NR so modem doesn't reject single-RAT masks)
+        val bitmask = when (mode) {
+            NetworkMode.MODE_5G -> "561151" // NR + LTE + WCDMA + GSM
+            NetworkMode.MODE_4G -> "36863"  // LTE + WCDMA + GSM (no NR)
+            NetworkMode.MODE_3G -> "32767"  // WCDMA + GSM only
         }
-        val legacyModeInt = when (mode) {
+
+        // Legacy & HyperOS preferred_network_mode integers
+        val modeInt = when (mode) {
             NetworkMode.MODE_5G -> 26 // NR_LTE_GSM_WCDMA
             NetworkMode.MODE_4G -> 9  // LTE_GSM_WCDMA
             NetworkMode.MODE_3G -> 0  // WCDMA_PREF
         }
 
-        val out1 = runShellCommand("cmd phone set-allowed-network-types-for-users -s $primarySubId $networkTypeBitmask")
-        val out2 = runShellCommand("settings put global preferred_network_mode$primarySubId $legacyModeInt")
-        // HyperOS also checks comma-separated preferred_network_mode
-        val out3 = runShellCommand("settings put global preferred_network_mode $legacyModeInt,$legacyModeInt")
-        return "Net(sub=$primarySubId): $out1 $out2 $out3".trim()
+        // Read existing SIM 2 mode so we preserve comma-separated "sim1,sim2" format used by Xiaomi
+        val currentDual = runShellCommand("settings get global preferred_network_mode")
+        val sim2Mode = currentDual.split(",").getOrNull(1)?.trim()?.toIntOrNull() ?: 26
+
+        val cmd = listOf(
+            "cmd phone set-allowed-network-types-for-users -s $primarySubId $bitmask",
+            "settings put global preferred_network_mode$primarySubId $modeInt",
+            "settings put global preferred_network_mode $modeInt,$sim2Mode",
+            "settings put global user_preferred_network_mode $modeInt,$sim2Mode"
+        ).joinToString(" ; ")
+
+        val res = runShellCommand(cmd)
+        return "SIM1 ${mode.label} [sub:$primarySubId]: $res"
     }
 
     /**
      * 3. Switch Primary SIM VoLTE On/Off
      */
-    fun setPrimarySimVoLte(enable: Boolean): String {
+    suspend fun setPrimarySimVoLte(enable: Boolean): String {
         val (primarySubId, _) = getSlotSubIds()
-        val value = if (enable) 1 else 0
-        val out1 = runShellCommand("settings put global volte_vt_enabled $value")
-        val out2 = runShellCommand("settings put global volte_vt_enabled$primarySubId $value")
-        val out3 = runShellCommand("cmd phone ims set-ims-service-enabled -s $primarySubId ${if (enable) "true" else "false"}")
-        return "VoLTE(sub=$primarySubId): $out1 $out2 $out3".trim()
+        val intVal = if (enable) 1 else 0
+        val boolStr = if (enable) "true" else "false"
+
+        val cmd = listOf(
+            "settings put global volte_vt_enabled $intVal",
+            "settings put global volte_vt_enabled0 $intVal",
+            "settings put global volte_vt_enabled$primarySubId $intVal",
+            "cmd phone ims set-ims-service-enabled -s $primarySubId $boolStr"
+        ).joinToString(" ; ")
+
+        val res = runShellCommand(cmd)
+        return "VoLTE [sub:$primarySubId -> $boolStr]: $res"
     }
 }
 
